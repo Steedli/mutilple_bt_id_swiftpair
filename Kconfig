@@ -27,4 +27,11 @@ config ZMS
 config NVS
 	default y if !(SOC_FLASH_NRF_RRAM || SOC_FLASH_NRF_MRAM)
 
+config BT_DIRECTED_ADVERTISING
+	bool "Enable directed advertising for fast reconnection"
+	default y
+	help
+	  Enable directed advertising to bonded devices for faster reconnection.
+	  Will retry multiple times before falling back to regular advertising.
+
 endmenu
