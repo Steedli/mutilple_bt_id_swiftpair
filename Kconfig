@@ -8,6 +8,14 @@ source "Kconfig.zephyr"
 
 menu "Nordic BLE HIDS Keyboard sample"
 
+config BT_DIRECTED_ADVERTISING
+	bool "Enable directed advertising"
+	default y
+	help
+	  "Try high duty cycle directed advertising to bonded peers of the
+	  current identity before falling back to regular Swift Pair
+	  advertising"
+
 config NFC_OOB_PAIRING
 	bool "Enable NFC OOB pairing"
 	depends on HAS_HW_NRF_NFCT

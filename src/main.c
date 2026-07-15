@@ -50,7 +50,10 @@
 
 #define NUM_BT_IDS 3
 
-static uint8_t current_bt_id = 0;
+/* IDs 1..NUM_BT_IDS are used for advertising; ID 0 is the default identity
+ * that the Bluetooth stack always creates and is left unused here.
+ */
+static uint8_t current_bt_id = 1;
 static uint8_t bond_delete_index = 0;
 
 #define ADV_STATUS_LED DK_LED1
@@ -120,6 +123,13 @@ BT_HIDS_DEF(hids_obj,
 	    INPUT_REPORT_KEYS_MAX_LEN);
 
 static volatile bool is_adv;
+/* Set while waiting for active connections to drop before completing a
+ * bt_id switch. Advertising (and the directed-adv bond snapshot) must not
+ * restart until conn_mode[] is actually empty, otherwise the peer being
+ * disconnected is still seen as "connected" and gets filtered out of the
+ * directed advertising candidate list.
+ */
+static bool pending_id_switch;
 
 /* Microsoft Swift Pair Beacon data */
 #define MSFT_VENDOR_ID 0x0006  /* Microsoft Vendor ID */
@@ -208,31 +218,137 @@ static void bond_cb(const struct bt_bond_info *info, void *user_data)
 	}
 }
 
-static void advertising_start(void)
+#if CONFIG_BT_DIRECTED_ADVERTISING
+/* Bonded addresses of the current identity, queued for directed advertising. */
+K_MSGQ_DEFINE(dir_adv_bonds_queue,
+	      sizeof(bt_addr_le_t),
+	      CONFIG_BT_MAX_PAIRED,
+	      4);
+
+static bt_addr_le_t current_dir_adv_addr;
+static uint8_t dir_adv_retry_count;
+#define DIR_ADV_MAX_RETRIES 3
+#define DIR_ADV_FALLBACK_TIMEOUT K_SECONDS(30)
+static struct k_work_delayable directed_adv_timeout_work;
+
+/* bt_le_adv_start() for a directed peer can transiently return -EINVAL: the
+ * Bluetooth host still holds the last reference of that peer's previous
+ * bt_conn object until right after our connected()/disconnected() callback
+ * returns (see bt_conn_exists_le() in conn.c), so it briefly looks "still
+ * connected" to a fresh directed-adv request. Retry shortly instead of
+ * giving up outright.
+ */
+#define DIR_ADV_START_RETRY_DELAY K_MSEC(100)
+static struct k_work_delayable dir_adv_start_retry_work;
+
+static void dir_adv_bond_find(const struct bt_bond_info *info, void *user_data)
+{
+	int err;
+
+	/* Skip peers that are already connected. */
+	for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++) {
+		if (conn_mode[i].conn) {
+			const bt_addr_le_t *dst = bt_conn_get_dst(conn_mode[i].conn);
+
+			if (!bt_addr_le_cmp(&info->addr, dst)) {
+				return;
+			}
+		}
+	}
+
+	err = k_msgq_put(&dir_adv_bonds_queue, (void *)&info->addr, K_NO_WAIT);
+	if (err) {
+		printk("No space in the queue for the bond.\n");
+	}
+}
+#endif
+
+static void advertising_continue(void)
 {
 	int err;
 	bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
 	size_t count = CONFIG_BT_ID_MAX;
 	char addr_str[BT_ADDR_LE_STR_LEN];
-	
+
 	/* Get and display current local address */
 	bt_id_get(addrs, &count);
 	if (current_bt_id < count) {
 		bt_addr_le_to_str(&addrs[current_bt_id], addr_str, sizeof(addr_str));
 		printk("Local address for bt_id %d: %s\n", current_bt_id, addr_str);
 	}
-	
-	/* Check if there are bonded devices for directed advertising */
+
+#if CONFIG_BT_DIRECTED_ADVERTISING
+	bt_addr_le_t dir_addr;
+	bool has_dir_addr = false;
+
+	if (dir_adv_retry_count > 0 && dir_adv_retry_count < DIR_ADV_MAX_RETRIES) {
+		dir_addr = current_dir_adv_addr;
+		has_dir_addr = true;
+		dir_adv_retry_count++;
+		printk("Retrying directed advertising (%u/%u)\n",
+		       dir_adv_retry_count, DIR_ADV_MAX_RETRIES);
+	} else if (!k_msgq_get(&dir_adv_bonds_queue, &dir_addr, K_NO_WAIT)) {
+		has_dir_addr = true;
+		current_dir_adv_addr = dir_addr;
+		dir_adv_retry_count = 1;
+	} else if (dir_adv_retry_count >= DIR_ADV_MAX_RETRIES) {
+		dir_adv_retry_count = 0;
+	}
+
+	if (has_dir_addr) {
+		struct bt_le_adv_param dir_param;
+
+		if (is_adv) {
+			err = bt_le_adv_stop();
+			if (err) {
+				printk("Advertising failed to stop (err %d)\n", err);
+				return;
+			}
+			is_adv = false;
+		}
+
+		dir_param = *BT_LE_ADV_CONN_DIR(&dir_addr);
+		dir_param.id = current_bt_id;
+		/* Use the fixed identity address instead of RPA so that central
+		 * devices which fail to resolve RPAs (e.g. some Razer laptops)
+		 * can still recognize and reconnect to this device.
+		 */
+		dir_param.options |= BT_LE_ADV_OPT_USE_IDENTITY;
+
+		err = bt_le_adv_start(&dir_param, NULL, 0, NULL, 0);
+		if (err) {
+			printk("Directed advertising failed to start (err %d), retrying shortly\n", err);
+			k_work_reschedule(&dir_adv_start_retry_work, DIR_ADV_START_RETRY_DELAY);
+			return;
+		}
+
+		bt_addr_le_to_str(&dir_addr, addr_str, sizeof(addr_str));
+		printk("Directed advertising to %s started on bt_id %d\n",
+		       addr_str, current_bt_id);
+
+		k_work_reschedule(&directed_adv_timeout_work, DIR_ADV_FALLBACK_TIMEOUT);
+		is_adv = true;
+		return;
+	}
+
+	k_work_cancel_delayable(&directed_adv_timeout_work);
+	k_work_cancel_delayable(&dir_adv_start_retry_work);
+#endif
+
+	if (is_adv) {
+		return;
+	}
+
+	/* Check if there are bonded devices, for logging purposes only. */
 	bond_count = 0;
 	bt_foreach_bond(current_bt_id, bond_cb, &bond_count);
-	
+
 	if (bond_count > 0) {
-		char addr_str[BT_ADDR_LE_STR_LEN];
 		bt_addr_le_to_str(&bonds[0].addr, addr_str, sizeof(addr_str));
-		printk("Found %d bonded device(s) for bt_id %d, first bonded: %s\n", 
+		printk("Found %d bonded device(s) for bt_id %d, first bonded: %s\n",
 		       bond_count, current_bt_id, addr_str);
 	}
-	
+
 	/* Use normal advertising for better compatibility and reliability */
 	struct bt_le_adv_param normal_param = BT_LE_ADV_PARAM_INIT(
 							BT_LE_ADV_OPT_CONN,
@@ -240,6 +356,7 @@ static void advertising_start(void)
 							BT_GAP_ADV_FAST_INT_MAX_1,
 							NULL);
 	normal_param.id = current_bt_id;
+	normal_param.options |= BT_LE_ADV_OPT_USE_IDENTITY;
 
 	err = bt_le_adv_start(&normal_param, ad, ARRAY_SIZE(ad), sd,
 				      ARRAY_SIZE(sd));
@@ -252,12 +369,47 @@ static void advertising_start(void)
 
 		return;
 	}
-	
-	printk("Advertising started with bt_id %d (%s bonded devices)\n", 
+
+	printk("Advertising started with bt_id %d (%s bonded devices)\n",
 	       current_bt_id, bond_count > 0 ? "has" : "no");
 
 	is_adv = true;
 }
+
+static void advertising_start(void)
+{
+#if CONFIG_BT_DIRECTED_ADVERTISING
+	k_msgq_purge(&dir_adv_bonds_queue);
+	bt_foreach_bond(current_bt_id, dir_adv_bond_find, NULL);
+	dir_adv_retry_count = 0;
+#endif
+	advertising_continue();
+}
+
+#if CONFIG_BT_DIRECTED_ADVERTISING
+static void directed_adv_timeout_process(struct k_work *work)
+{
+	int err;
+
+	if (is_adv) {
+		err = bt_le_adv_stop();
+		if (err) {
+			printk("Directed advertising failed to stop (err %d)\n", err);
+			return;
+		}
+		is_adv = false;
+	}
+
+	dir_adv_retry_count = DIR_ADV_MAX_RETRIES;
+	printk("Directed advertising timed out, falling back to regular advertising\n");
+	advertising_continue();
+}
+
+static void dir_adv_start_retry_process(struct k_work *work)
+{
+	advertising_continue();
+}
+#endif
 
 
 static void create_bt_ids(void)
@@ -266,7 +418,7 @@ static void create_bt_ids(void)
 	bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
 	size_t count = CONFIG_BT_ID_MAX;
 
-	for (uint8_t i = 0; i < NUM_BT_IDS; i++) {
+	for (uint8_t i = 1; i <= NUM_BT_IDS; i++) {
 		size_t id_count = 0xFF;
 
 		/* Retrieve the number of currently configured identities. */
@@ -286,10 +438,10 @@ static void create_bt_ids(void)
 			printk("ID %d already exists (restored from settings)\n", i);
 		}
 	}
-	
+
 	/* Display address info for each identity */
 	bt_id_get(addrs, &count);
-	for (uint8_t i = 0; i < count && i < NUM_BT_IDS; i++) {
+	for (uint8_t i = 1; i <= NUM_BT_IDS && i < count; i++) {
 		char addr_str[BT_ADDR_LE_STR_LEN];
 		bt_addr_le_to_str(&addrs[i], addr_str, sizeof(addr_str));
 		printk("ID %d: %s (Each ID appears as independent device)\n", i, addr_str);
@@ -309,26 +461,52 @@ static void disconnect_all_connections(void)
 }
 
 
+static void switch_bt_id_continue(void)
+{
+	current_bt_id = (current_bt_id % NUM_BT_IDS) + 1;
+	printk("Switched to bt_id: %d\n", current_bt_id);
+
+	// Restart advertising with new id
+	advertising_start();
+}
+
+
 static void switch_bt_id(void)
 {
+	bool has_conn = false;
+
 	// Stop advertising first
 	if (is_adv) {
 		bt_le_adv_stop();
 		is_adv = false;
 		printk("Advertising stopped for bt_id switch\n");
 	}
-	
-	// Disconnect all connections before switching id
+
+#if CONFIG_BT_DIRECTED_ADVERTISING
+	k_work_cancel_delayable(&directed_adv_timeout_work);
+	k_work_cancel_delayable(&dir_adv_start_retry_work);
+#endif
+
+	for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++) {
+		if (conn_mode[i].conn) {
+			has_conn = true;
+			break;
+		}
+	}
+
+	if (!has_conn) {
+		switch_bt_id_continue();
+		return;
+	}
+
+	/* Defer the actual switch to disconnected(), once conn_mode[] is
+	 * confirmed empty. Restarting advertising while the disconnect is
+	 * still in flight would make the peer look "connected" and get it
+	 * filtered out of the directed advertising candidate list.
+	 */
+	pending_id_switch = true;
 	disconnect_all_connections();
-
-	// Wait for disconnections and cleanup to complete
-	k_sleep(K_MSEC(500));
-
-	current_bt_id = (current_bt_id + 1) % NUM_BT_IDS;
-	printk("Switched to bt_id: %d\n", current_bt_id);
-	
-	// Restart advertising with new id
-	advertising_start();
+	printk("Disconnecting... bt_id switch will continue once connections drop\n");
 }
 
 
@@ -401,10 +579,24 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
 	if (err) {
+#if CONFIG_BT_DIRECTED_ADVERTISING
+		if (err == BT_HCI_ERR_ADV_TIMEOUT) {
+			k_work_cancel_delayable(&directed_adv_timeout_work);
+			k_work_cancel_delayable(&dir_adv_start_retry_work);
+			is_adv = false;
+			printk("Directed advertising to %s timed out\n", addr);
+			advertising_continue();
+			return;
+		}
+#endif
 		printk("Failed to connect to %s 0x%02x %s\n", addr, err, bt_hci_err_to_str(err));
 		return;
 	}
 
+#if CONFIG_BT_DIRECTED_ADVERTISING
+	k_work_cancel_delayable(&directed_adv_timeout_work);
+	k_work_cancel_delayable(&dir_adv_start_retry_work);
+#endif
 	printk("Connected %s (bt_id: %d)\n", addr, current_bt_id);
 	dk_set_led_on(CON_STATUS_LED);
 	
@@ -482,6 +674,14 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
 	if (!is_any_dev_connected) {
 		dk_set_led_off(CON_STATUS_LED);
+	}
+
+	if (pending_id_switch) {
+		if (!is_any_dev_connected) {
+			pending_id_switch = false;
+			switch_bt_id_continue();
+		}
+		return;
 	}
 
 #if CONFIG_NFC_OOB_PAIRING
@@ -1115,6 +1315,11 @@ int main(void)
 
 	/* Create IDs after loading settings to avoid overwriting saved addresses */
 	create_bt_ids();
+
+#if CONFIG_BT_DIRECTED_ADVERTISING
+	k_work_init_delayable(&directed_adv_timeout_work, directed_adv_timeout_process);
+	k_work_init_delayable(&dir_adv_start_retry_work, dir_adv_start_retry_process);
+#endif
 
 #if CONFIG_NFC_OOB_PAIRING
 	k_work_init(&adv_work, delayed_advertising_start);
