@@ -1,0 +1,678 @@
+From c7e524345e305cb88cc4ee61f240d2f0ea02b033 Mon Sep 17 00:00:00 2001
+From: steedli <steed.li@nordicsemi.no>
+Date: Fri, 17 Jul 2026 17:22:24 +0800
+Subject: [PATCH] [nrf noup] bluetooth: host: Add support for bonding with same
+ peer
+
+Backport of nrfconnect/sdk-zephyr#2963 to the v3.0.0 baseline so that
+CONFIG_BT_ID_AUTO_SWAP_MATCHING_BONDS (added upstream after this
+snapshot) is available here too.
+
+Adds a BT_KEYS_ID_CONFLICT flag to bt_keys: set when a new bond
+conflicts (same address/IRK) with a bond on another local identity.
+Conflicting keys are not added to the Resolving List immediately; the
+existing entry stays until the new identity actually starts
+advertising/scanning, at which point bt_id_resolving_list_check_and_update()
+swaps the old entry out for the new one (or returns -EPERM if the old
+identity's advertiser is still running).
+
+Adapted for this baseline's structure: keys.c's id_add() here calls
+bt_id_add() directly (no BT_KEYS_ID_PENDING_ADD deferral present at
+this snapshot), so the conflict-flag skip was added at that call site
+instead. smp_br_id_add_replace() (BR/EDR) does not exist yet at this
+baseline and was not touched.
+
+Verified: builds and boots on nRF54L15 DK with
+CONFIG_BT_ID_AUTO_SWAP_MATCHING_BONDS=y via
+D:\ncs\example\mutilple_bt_id_swiftpair (branch
+mutilple_bt_id_swiftpair-v3.0.0).
+
+Signed-off-by: Pavel Vasilyev <pavel.vasilyev@nordicsemi.no>
+(backported by Claude Sonnet 5 from commit 2f4f27995d80 in
+nrfconnect/sdk-zephyr, found locally in D:\ncs\v3.3.1\zephyr)
+---
+ subsys/bluetooth/host/Kconfig    |  18 +++
+ subsys/bluetooth/host/adv.c      |  51 +++++++
+ subsys/bluetooth/host/adv.h      |   2 +
+ subsys/bluetooth/host/hci_core.h |   3 +-
+ subsys/bluetooth/host/id.c       | 219 ++++++++++++++++++++++++++++---
+ subsys/bluetooth/host/id.h       |  25 ++++
+ subsys/bluetooth/host/keys.c     |  73 +++++++++++
+ subsys/bluetooth/host/keys.h     |   6 +
+ subsys/bluetooth/host/smp.c      |  14 +-
+ 9 files changed, 391 insertions(+), 20 deletions(-)
+
+diff --git a/subsys/bluetooth/host/Kconfig b/subsys/bluetooth/host/Kconfig
+index d49ea5c8fde..7590595f161 100644
+--- a/subsys/bluetooth/host/Kconfig
++++ b/subsys/bluetooth/host/Kconfig
+@@ -633,6 +633,24 @@ config BT_ID_UNPAIR_MATCHING_BONDS
+ 	  link-layer. The Host does not have control over this acknowledgment,
+ 	  and the order of distribution is fixed by the specification.
+ 
++config BT_ID_AUTO_SWAP_MATCHING_BONDS
++	bool "Automatically swap conflicting entries in the Resolving List"
++	depends on !BT_ID_UNPAIR_MATCHING_BONDS
++	depends on BT_SMP && BT_PERIPHERAL && !BT_CENTRAL
++	help
++	  If this option is enabled, the Host will not add a new bond with
++	  the same peer address (or IRK) to the Resolving List if there is
++	  already a bond with the same peer address (or IRK) on another local
++	  identity.
++
++	  In case of Peripheral, the Host will swap the existing entry in the
++	  Resolving List with the new one, so that the new bond will be used for
++	  address resolution for the new local identity if the device starts
++	  advertising with the new local identity.
++
++	  Important: this option is supported exclusively in the Peripheral
++	  role. Excluding the Central role.
++
+ config BT_ID_ALLOW_UNAUTH_OVERWRITE
+ 	bool "Allow unauthenticated pairing with same peer with other local identity"
+ 	depends on !BT_SMP_ALLOW_UNAUTH_OVERWRITE
+diff --git a/subsys/bluetooth/host/adv.c b/subsys/bluetooth/host/adv.c
+index d2e0c255e12..6a2e63f221d 100644
+--- a/subsys/bluetooth/host/adv.c
++++ b/subsys/bluetooth/host/adv.c
+@@ -259,6 +259,24 @@ struct bt_le_ext_adv *bt_hci_adv_lookup_handle(uint8_t handle)
+ #endif /* CONFIG_BT_BROADCASTER */
+ #endif /* defined(CONFIG_BT_EXT_ADV) */
+ 
++struct bt_le_ext_adv *bt_adv_lookup_by_id(uint8_t id)
++{
++#if defined(CONFIG_BT_EXT_ADV)
++	for (size_t i = 0; i < ARRAY_SIZE(adv_pool); i++) {
++		if (atomic_test_bit(adv_pool[i].flags, BT_ADV_CREATED) &&
++		    adv_pool[i].id == id) {
++			return &adv_pool[i];
++		}
++	}
++#else
++	if (atomic_test_bit(bt_dev.adv.flags, BT_ADV_CREATED) && bt_dev.adv.id == id) {
++		return &bt_dev.adv;
++	}
++#endif
++
++	return NULL;
++}
++
+ void bt_le_ext_adv_foreach(void (*func)(struct bt_le_ext_adv *adv, void *data),
+ 			   void *data)
+ {
+@@ -1008,6 +1026,14 @@ int bt_le_adv_start_legacy(struct bt_le_ext_adv *adv,
+ 	adv->id = param->id;
+ 	bt_dev.adv_conn_id = adv->id;
+ 
++	if (IS_ENABLED(CONFIG_BT_ID_AUTO_SWAP_MATCHING_BONDS)) {
++		err = bt_id_resolving_list_check_and_update(adv->id, param->peer);
++		if (err) {
++			LOG_ERR("Failed to check and update resolving list: %d", err);
++			return err;
++		}
++	}
++
+ 	err = bt_id_set_adv_own_addr(adv, param->options, dir_adv,
+ 				     &set_param.own_addr_type);
+ 	if (err) {
+@@ -1323,6 +1349,15 @@ int bt_le_adv_start_ext(struct bt_le_ext_adv *adv,
+ 	}
+ 
+ 	adv->id = param->id;
++
++	if (IS_ENABLED(CONFIG_BT_ID_AUTO_SWAP_MATCHING_BONDS)) {
++		err = bt_id_resolving_list_check_and_update(adv->id, param->peer);
++		if (err) {
++			LOG_ERR("Failed to check and update resolving list: %d", err);
++			return err;
++		}
++	}
++
+ 	err = le_ext_adv_param_set(adv, param, sd != NULL);
+ 	if (err) {
+ 		return err;
+@@ -1678,6 +1713,22 @@ int bt_le_ext_adv_start(struct bt_le_ext_adv *adv,
+ 		return -EALREADY;
+ 	}
+ 
++	if (IS_ENABLED(CONFIG_BT_ID_AUTO_SWAP_MATCHING_BONDS)) {
++		const bt_addr_le_t *peer;
++
++		if (bt_addr_le_eq(&adv->target_addr, BT_ADDR_LE_ANY)) {
++			peer = NULL;
++		} else {
++			peer = &adv->target_addr;
++		}
++
++		err = bt_id_resolving_list_check_and_update(adv->id, peer);
++		if (err) {
++			LOG_ERR("Failed to check and update resolving list: %d", err);
++			return err;
++		}
++	}
++
+ 	if (IS_ENABLED(CONFIG_BT_PERIPHERAL) &&
+ 	    atomic_test_bit(adv->flags, BT_ADV_CONNECTABLE)) {
+ 		err = le_adv_start_add_conn(adv, &conn);
+diff --git a/subsys/bluetooth/host/adv.h b/subsys/bluetooth/host/adv.h
+index 3a03bfe8f4c..333edef8257 100644
+--- a/subsys/bluetooth/host/adv.h
++++ b/subsys/bluetooth/host/adv.h
+@@ -15,6 +15,8 @@ int bt_le_adv_set_enable(struct bt_le_ext_adv *adv, bool enable);
+ void bt_le_ext_adv_foreach(void (*func)(struct bt_le_ext_adv *adv, void *data),
+ 			   void *data);
+ 
++struct bt_le_ext_adv *bt_adv_lookup_by_id(uint8_t id);
++
+ int bt_le_adv_set_enable_ext(struct bt_le_ext_adv *adv,
+ 			 bool enable,
+ 			 const struct bt_le_ext_adv_start_param *param);
+diff --git a/subsys/bluetooth/host/hci_core.h b/subsys/bluetooth/host/hci_core.h
+index 6502be80c3f..972c4e08922 100644
+--- a/subsys/bluetooth/host/hci_core.h
++++ b/subsys/bluetooth/host/hci_core.h
+@@ -489,7 +489,8 @@ struct bt_keys;
+ void bt_id_add(struct bt_keys *keys);
+ void bt_id_del(struct bt_keys *keys);
+ 
+-struct bt_keys *bt_id_find_conflict(struct bt_keys *candidate);
++struct bt_keys *bt_id_find_conflict(struct bt_keys *candidate, bool check_all_irk);
++bool bt_id_find_conflict_multiple(struct bt_keys *candidate, struct bt_keys **first_conflict);
+ 
+ int bt_setup_random_id_addr(void);
+ int bt_setup_public_id_addr(void);
+diff --git a/subsys/bluetooth/host/id.c b/subsys/bluetooth/host/id.c
+index 67f691dfa79..751acb37885 100644
+--- a/subsys/bluetooth/host/id.c
++++ b/subsys/bluetooth/host/id.c
+@@ -916,7 +916,7 @@ static void pending_id_update(struct bt_keys *keys, void *data)
+ 	}
+ }
+ 
+-static void bt_id_pending_keys_update_set(struct bt_keys *keys, uint8_t flag)
++void bt_id_pending_keys_update_set(struct bt_keys *keys, uint8_t flag)
+ {
+ 	atomic_set_bit(bt_dev.flags, BT_DEV_ID_PENDING);
+ 	keys->state |= flag;
+@@ -934,9 +934,33 @@ void bt_id_pending_keys_update(void)
+ 	}
+ }
+ 
++static bool keys_conflict_check(const struct bt_keys *candidate, const struct bt_keys *resident)
++{
++	bool addr_conflict;
++	bool irk_conflict;
++
++	addr_conflict = bt_addr_le_eq(&candidate->addr, &resident->addr);
++
++	/* All-zero IRK is "no IRK", and does not conflict with other Zero-IRKs. */
++	irk_conflict = (!bt_irk_eq(&candidate->irk, &(struct bt_irk){}) &&
++			bt_irk_eq(&candidate->irk, &resident->irk));
++
++	if (addr_conflict || irk_conflict) {
++		LOG_DBG("Resident : addr %s and IRK %s", bt_addr_le_str(&resident->addr),
++			bt_hex(resident->irk.val, sizeof(resident->irk.val)));
++		LOG_DBG("Candidate: addr %s and IRK %s", bt_addr_le_str(&candidate->addr),
++			bt_hex(candidate->irk.val, sizeof(candidate->irk.val)));
++
++		return true;
++	}
++
++	return false;
++}
++
+ struct bt_id_conflict {
+ 	struct bt_keys *candidate;
+ 	struct bt_keys *found;
++	bool check_all_irk;
+ };
+ 
+ /* The Controller Resolve List is constrained by 7.8.38 "LE Add Device To
+@@ -948,8 +972,6 @@ struct bt_id_conflict {
+ void find_rl_conflict(struct bt_keys *resident, void *user_data)
+ {
+ 	struct bt_id_conflict *conflict = user_data;
+-	bool addr_conflict;
+-	bool irk_conflict;
+ 
+ 	__ASSERT_NO_MSG(conflict != NULL);
+ 	__ASSERT_NO_MSG(conflict->candidate != NULL);
+@@ -962,30 +984,26 @@ void find_rl_conflict(struct bt_keys *resident, void *user_data)
+ 	}
+ 
+ 	/* Test against committed bonds only. */
+-	if ((resident->state & BT_KEYS_ID_ADDED) == 0) {
++	if (!conflict->check_all_irk && (resident->state & BT_KEYS_ID_ADDED) == 0) {
++		/* If the resident bond is not committed, we cannot have a conflict. */
+ 		return;
+ 	}
+ 
+-	addr_conflict = bt_addr_le_eq(&conflict->candidate->addr, &resident->addr);
+-
+-	/* All-zero IRK is "no IRK", and does not conflict with other Zero-IRKs. */
+-	irk_conflict = (!bt_irk_eq(&conflict->candidate->irk, &(struct bt_irk){}) &&
+-			bt_irk_eq(&conflict->candidate->irk, &resident->irk));
+-
+-	if (addr_conflict || irk_conflict) {
+-		LOG_DBG("Resident : addr %s and IRK %s", bt_addr_le_str(&resident->addr),
+-			bt_hex(resident->irk.val, sizeof(resident->irk.val)));
+-		LOG_DBG("Candidate: addr %s and IRK %s", bt_addr_le_str(&conflict->candidate->addr),
+-			bt_hex(conflict->candidate->irk.val, sizeof(conflict->candidate->irk.val)));
++	if (resident->id == conflict->candidate->id) {
++		/* If the IDs are the same, we cannot have a conflict. */
++		return;
++	}
+ 
++	if (keys_conflict_check(conflict->candidate, resident)) {
+ 		conflict->found = resident;
+ 	}
+ }
+ 
+-struct bt_keys *bt_id_find_conflict(struct bt_keys *candidate)
++struct bt_keys *bt_id_find_conflict(struct bt_keys *candidate, bool check_all_irk)
+ {
+ 	struct bt_id_conflict conflict = {
+ 		.candidate = candidate,
++		.check_all_irk = check_all_irk,
+ 	};
+ 
+ 	bt_keys_foreach_type(BT_KEYS_IRK, find_rl_conflict, &conflict);
+@@ -993,6 +1011,59 @@ struct bt_keys *bt_id_find_conflict(struct bt_keys *candidate)
+ 	return conflict.found;
+ }
+ 
++struct bt_id_conflict_multiple {
++	struct bt_keys *candidate;
++	struct bt_keys *found;
++	bool found_multiple;
++};
++
++void find_rl_conflict_multiple(struct bt_keys *resident, void *user_data)
++{
++	struct bt_id_conflict_multiple *conflict = user_data;
++
++	__ASSERT_NO_MSG(conflict != NULL);
++	__ASSERT_NO_MSG(conflict->candidate != NULL);
++	__ASSERT_NO_MSG(resident != NULL);
++
++	if (conflict->found_multiple) {
++		/* If we already found enough conflicts, we can stop searching. */
++		return;
++	}
++
++	if (resident->id == conflict->candidate->id) {
++		/* If the IDs are the same, we cannot have a conflict. */
++		return;
++	}
++
++	if (keys_conflict_check(conflict->candidate, resident)) {
++		if (conflict->found) {
++			conflict->found_multiple = true;
++
++			LOG_WRN("Found multiple conflicts for %s: addr %s and IRK %s",
++				bt_addr_le_str(&conflict->candidate->addr),
++				bt_addr_le_str(&resident->addr),
++				bt_hex(resident->irk.val, sizeof(resident->irk.val)));
++		} else {
++			conflict->found = resident;
++		}
++	}
++}
++
++bool bt_id_find_conflict_multiple(struct bt_keys *candidate, struct bt_keys **first_conflict)
++{
++	struct bt_id_conflict_multiple conflict = {
++		.candidate = candidate,
++	};
++
++	bt_keys_foreach_type(BT_KEYS_IRK, find_rl_conflict_multiple, &conflict);
++
++	if (first_conflict != NULL) {
++		*first_conflict = conflict.found;
++	}
++
++	return conflict.found_multiple;
++}
++
+ void bt_id_add(struct bt_keys *keys)
+ {
+ 	CHECKIF(keys == NULL) {
+@@ -1244,6 +1315,122 @@ done:
+ 		bt_le_ext_adv_foreach(adv_unpause_enabled, NULL);
+ 	}
+ }
++
++static int conflict_check_and_replace(uint8_t id, struct bt_keys *keys)
++{
++	/* For the given key check if it has conflicts with other keys in the Resolving List
++	 * (such keys have BT_KEYS_ID_ADDED state and BT_KEYS_ID_CONFLICT flag set). If it does, we
++	 * need to remove the conflicting key from the Resolving List and add the new key.
++	 *
++	 * If the key is not in the Resolving List, we can add the new key right away.
++	 *
++	 * If advertiser for the conflicting key is enabled, we cannot remove the key from the
++	 * Resolving List, so we return an error.
++	 */
++
++	struct bt_keys *conflict;
++	const struct bt_le_ext_adv *adv;
++
++	if (!(keys->flags & BT_KEYS_ID_CONFLICT)) {
++		LOG_DBG("Key has no conflicts for id %u addr %s", id, bt_addr_le_str(&keys->addr));
++		return 0;
++	}
++
++	if (keys->state & BT_KEYS_ID_ADDED) {
++		LOG_DBG("Key is already added to resolving list for id %u addr %s", id,
++			bt_addr_le_str(&keys->addr));
++		return 0;
++	}
++
++	/* bt_id_find_conflict returns only keys added to the Resolving List (state is
++	 * BT_KEYS_ID_ADDED). If the key has conflict, but no keys were added (for example, if the
++	 * last added key was removed after bt_unpair()), then this function will return NULL. Then,
++	 * we don't need to remove a conflicting key from the Resolving List. Otherwise, we need to
++	 * remove the conflicting key from the Resolving List before adding the new key.
++	 */
++	conflict = bt_id_find_conflict(keys, false);
++	if (conflict != NULL) {
++		__ASSERT_NO_MSG((conflict->flags & BT_KEYS_ID_CONFLICT) != 0);
++
++		LOG_DBG("Found conflicting key with id %u addr %s", conflict->id,
++			bt_addr_le_str(&conflict->addr));
++
++		adv = bt_adv_lookup_by_id(conflict->id);
++		if (adv && atomic_test_bit(adv->flags, BT_ADV_ENABLED)) {
++			LOG_WRN("Cannot remove the conflicting key from the Resolving List while"
++				" advertising");
++			return -EPERM;
++		}
++
++		/* Drop BT_KEYS_ID_PENDING_DEL flag if we were about to delete the keys since we
++		 * delete it here.
++		 */
++		conflict->state &= ~BT_KEYS_ID_PENDING_DEL;
++		bt_id_del(conflict);
++	}
++
++	bt_id_add(keys);
++
++	return 0;
++}
++
++struct bt_id_resolve {
++	uint8_t id;
++	int err;
++};
++
++static void check_and_add_keys_for_id(struct bt_keys *keys, void *data)
++{
++	struct bt_id_resolve *resolve = data;
++
++	if (resolve->err) {
++		/* Skipping other keys because we got error. */
++		return;
++	}
++
++	if (resolve->id != keys->id) {
++		/* We are only interested in keys for the given id */
++		return;
++	}
++
++	resolve->err = conflict_check_and_replace(resolve->id, keys);
++}
++
++int bt_id_resolving_list_check_and_update(uint8_t id, const bt_addr_le_t *peer)
++{
++	int err;
++
++	if (peer == NULL) {
++		struct bt_id_resolve resolve = {
++			.id = id,
++		};
++
++		LOG_DBG("Updating resolving list for id %u without peer address", id);
++
++		bt_keys_foreach_type(BT_KEYS_IRK, check_and_add_keys_for_id, &resolve);
++		err = resolve.err;
++	} else {
++		struct bt_keys *keys;
++
++		LOG_DBG("Updating resolving list for id %u addr %s", id, bt_addr_le_str(peer));
++
++		keys = bt_keys_get_addr(id, peer);
++		if (!keys) {
++			LOG_DBG("No keys found for id %u addr %s", id, bt_addr_le_str(peer));
++			return -ENOENT;
++		}
++
++		err = conflict_check_and_replace(id, keys);
++	}
++
++	if (err) {
++		LOG_ERR("Failed to update resolving list for id %u addr %s (err %d)", id,
++			peer ? bt_addr_le_str(peer) : "NULL", err);
++		return err;
++	}
++
++	return err;
++}
+ #endif /* defined(CONFIG_BT_SMP) */
+ 
+ void bt_id_get(bt_addr_le_t *addrs, size_t *count)
+diff --git a/subsys/bluetooth/host/id.h b/subsys/bluetooth/host/id.h
+index 55a25d93400..11e749787d2 100644
+--- a/subsys/bluetooth/host/id.h
++++ b/subsys/bluetooth/host/id.h
+@@ -44,4 +44,29 @@ int bt_id_set_private_addr(uint8_t id);
+ 
+ void bt_id_pending_keys_update(void);
+ 
++void bt_id_pending_keys_update_set(struct bt_keys *keys, uint8_t flag);
++
+ void bt_id_adv_limited_stopped(struct bt_le_ext_adv *adv);
++
++/**
++ * @brief Check and update the resolving list for a given identity.
++ *
++ * This function checks if the resolving list contains the keys for the given
++ * identity and peer address. If the keys are not present, it adds them to the
++ * resolving list. If the keys are present, it checks for conflicts with
++ * existing keys in the resolving list. If a conflict is found, it replaces
++ * the conflicting key with the new key.
++ *
++ * If the peer address is NULL, it updates the resolving list for all keys that belong to the given
++ * identity.
++ *
++ * If for any of the keys belonging to the given identity a conflict is found and the advertiser for
++ * that key is enabled, the function returns an error.
++ *
++ * @param id The identity ID to check and update.
++ * @param peer The peer address to check against the resolving list.
++ *
++ * @return 0 on success, or a negative error code on failure.
++ * @return -EPERM if a conflict is found and the advertiser for the conflicting key is enabled.
++ */
++int bt_id_resolving_list_check_and_update(uint8_t id, const bt_addr_le_t *peer);
+diff --git a/subsys/bluetooth/host/keys.c b/subsys/bluetooth/host/keys.c
+index 6740d43b1cd..54f4cdfed98 100644
+--- a/subsys/bluetooth/host/keys.c
++++ b/subsys/bluetooth/host/keys.c
+@@ -26,6 +26,7 @@
+ #include "conn_internal.h"
+ #include "gatt_internal.h"
+ #include "hci_core.h"
++#include "id.h"
+ #include "smp.h"
+ #include "settings.h"
+ #include "keys.h"
+@@ -309,16 +310,57 @@ void bt_keys_add_type(struct bt_keys *keys, enum bt_keys_type type)
+ 	keys->keys |= type;
+ }
+ 
++static void add_id_cb(struct k_work *work)
++{
++	bt_id_pending_keys_update();
++}
++
++static K_WORK_DEFINE(add_id_work, add_id_cb);
++
+ void bt_keys_clear(struct bt_keys *keys)
+ {
++	struct bt_keys *conflict = NULL;
++
+ 	__ASSERT_NO_MSG(keys != NULL);
+ 
+ 	LOG_DBG("%s (keys 0x%04x)", bt_addr_le_str(&keys->addr), keys->keys);
+ 
++	if (IS_ENABLED(CONFIG_BT_ID_AUTO_SWAP_MATCHING_BONDS) &&
++	    (keys->flags & BT_KEYS_ID_CONFLICT) != 0) {
++		/* We need to check how many conflicting keys left. If there is only one conflicting
++		 * key left, we can remove the BT_KEYS_ID_CONFLICT flag from it so that Host don't
++		 * need to check and update the Resolving List whenever this is needed. The key
++		 * should be re-added to the Resolving List.
++		 */
++		bool found_multiple;
++
++		found_multiple = bt_id_find_conflict_multiple(keys, &conflict);
++		if (conflict) {
++			if (found_multiple || (conflict->state & BT_KEYS_ID_ADDED) != 0) {
++				/* If we found multiple conflicting keys or the conflicting key
++				 * is already added to the ID list, we don't need to clear the
++				 * conflict flag for it and re-add it to the Resolving List.
++				 */
++				conflict = NULL;
++			} else {
++				/* Clear the conflict flag for the conflicting key */
++				conflict->flags &= ~BT_KEYS_ID_CONFLICT;
++			}
++		}
++	}
++
+ 	if (keys->state & BT_KEYS_ID_ADDED) {
+ 		bt_id_del(keys);
+ 	}
+ 
++	if (conflict) {
++		/* Re-add the conflicting key to the Resolving List if it was the last conflicting
++		 * key.
++		 */
++		bt_id_pending_keys_update_set(conflict, BT_KEYS_ID_PENDING_ADD);
++		k_work_submit(&add_id_work);
++	}
++
+ 	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
+ 		/* Delete stored keys from flash */
+ 		bt_settings_delete_keys(keys->id, &keys->addr);
+@@ -346,6 +388,28 @@ int bt_keys_store(struct bt_keys *keys)
+ 	return 0;
+ }
+ 
++static void check_and_set_id_conflict_flag(struct bt_keys *keys)
++{
++	struct bt_keys *conflict;
++
++	if (!IS_ENABLED(CONFIG_BT_ID_AUTO_SWAP_MATCHING_BONDS)) {
++		/* If auto-swap is not enabled, we don't need to check for conflicts */
++		return;
++	}
++
++	/* Use bt_id_find_conflict() to check if there are any conflicting keys for the given keys.
++	 * If there is at least one, set the BT_KEYS_ID_CONFLICT flag for both the keys and the
++	 * conflicting key.
++	 */
++	conflict = bt_id_find_conflict(keys, true);
++	if (conflict != NULL) {
++		LOG_DBG("Found conflicting key %p.", conflict);
++
++		keys->flags |= BT_KEYS_ID_CONFLICT;
++		conflict->flags |= BT_KEYS_ID_CONFLICT;
++	}
++}
++
+ static int keys_set(const char *name, size_t len_rd, settings_read_cb read_cb,
+ 		    void *cb_arg)
+ {
+@@ -426,6 +490,8 @@ static int keys_set(const char *name, size_t len_rd, settings_read_cb read_cb,
+ 		memcpy(keys->storage_start, val, len);
+ 	}
+ 
++	check_and_set_id_conflict_flag(keys);
++
+ 	LOG_DBG("Successfully restored keys for %s", bt_addr_le_str(&addr));
+ #if defined(CONFIG_BT_KEYS_OVERWRITE_OLDEST)
+ 	if (aging_counter_val < keys->aging_counter) {
+@@ -439,6 +505,13 @@ static void id_add(struct bt_keys *keys, void *user_data)
+ {
+ 	__ASSERT_NO_MSG(keys != NULL);
+ 
++	if (keys->flags & BT_KEYS_ID_CONFLICT) {
++		/* If the keys have the conflict flag set, we don't want to add them to the ID
++		 * list, as this will cause issues with resolving list.
++		 */
++		return;
++	}
++
+ 	bt_id_add(keys);
+ }
+ 
+diff --git a/subsys/bluetooth/host/keys.h b/subsys/bluetooth/host/keys.h
+index c1da17fb488..ec39af4b6ef 100644
+--- a/subsys/bluetooth/host/keys.h
++++ b/subsys/bluetooth/host/keys.h
+@@ -38,6 +38,12 @@ enum {
+ 	/* Bit 2 and 3 might accidentally exist in old stored keys */
+ 	BT_KEYS_SC              = BIT(4),
+ 	BT_KEYS_OOB             = BIT(5),
++	/** Indicates that the keys are in conflict with existing keys.
++	 *
++	 * This is used to indicate that the keys being added conflict with
++	 * existing keys from different identity.
++	 */
++	BT_KEYS_ID_CONFLICT     = BIT(6),
+ };
+ 
+ struct bt_ltk {
+diff --git a/subsys/bluetooth/host/smp.c b/subsys/bluetooth/host/smp.c
+index d439024d5c5..55fb009cc47 100644
+--- a/subsys/bluetooth/host/smp.c
++++ b/subsys/bluetooth/host/smp.c
+@@ -3889,16 +3889,24 @@ static uint8_t smp_id_add_replace(struct bt_smp *smp, struct bt_keys *new_bond)
+ 	 */
+ 	__ASSERT_NO_MSG(!(smp->remote_dist & BT_SMP_DIST_ID_KEY));
+ 
+-	conflict = bt_id_find_conflict(new_bond);
++	conflict = bt_id_find_conflict(new_bond, IS_ENABLED(CONFIG_BT_ID_AUTO_SWAP_MATCHING_BONDS));
+ 	if (conflict) {
+ 		LOG_DBG("New bond conflicts with a bond on id %d.", conflict->id);
+ 	}
+ 
+-	if (conflict && !IS_ENABLED(CONFIG_BT_ID_UNPAIR_MATCHING_BONDS)) {
++	if (conflict && !IS_ENABLED(CONFIG_BT_ID_AUTO_SWAP_MATCHING_BONDS) &&
++	    !IS_ENABLED(CONFIG_BT_ID_UNPAIR_MATCHING_BONDS)) {
+ 		LOG_WRN("Refusing new pairing. The old bond must be unpaired first.");
+ 		return BT_SMP_ERR_AUTH_REQUIREMENTS;
+ 	}
+ 
++	if (conflict && IS_ENABLED(CONFIG_BT_ID_AUTO_SWAP_MATCHING_BONDS)) {
++		LOG_WRN("Conflict detected with %p. Don't add key to Resolve List.", conflict);
++		new_bond->flags |= BT_KEYS_ID_CONFLICT;
++		conflict->flags |= BT_KEYS_ID_CONFLICT;
++		return 0;
++	}
++
+ 	if (conflict && IS_ENABLED(CONFIG_BT_ID_UNPAIR_MATCHING_BONDS)) {
+ 		bool trust_ok;
+ 		int unpair_err;
+@@ -3915,7 +3923,7 @@ static uint8_t smp_id_add_replace(struct bt_smp *smp, struct bt_keys *new_bond)
+ 		__ASSERT_NO_MSG(!unpair_err);
+ 	}
+ 
+-	__ASSERT_NO_MSG(!bt_id_find_conflict(new_bond));
++	__ASSERT_NO_MSG(!bt_id_find_conflict(new_bond, false));
+ 	bt_id_add(new_bond);
+ 	return 0;
+ }
+-- 
+2.54.0.windows.1
+
